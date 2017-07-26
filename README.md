@@ -21,6 +21,12 @@ To bind the java agent to a specific IP change the port number to `host:port`.
 
 See `./run_sample_httpserver.sh` for a sample script that runs the httpserver against itself.
 
+To run as a docker container:
+
+```
+docker run -v /path/to/config.yml:/etc/jmx_exporter/config.yml:ro scrapinghub/jmx_exporter:latest
+```
+
 ## Building
 
 `mvn package` to build.
