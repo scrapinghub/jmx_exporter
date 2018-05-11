@@ -1,19 +1,7 @@
 package io.prometheus.jmx;
 
-import java.io.IOException;
-import java.lang.management.ManagementFactory;
-import java.util.HashMap;
-import java.util.HashSet;
-import java.util.LinkedHashMap;
-import java.util.LinkedList;
-import java.util.List;
-import java.util.Map;
-import java.util.Set;
-import java.util.TreeSet;
-import java.util.logging.Level;
-import java.util.logging.Logger;
-import java.util.regex.Matcher;
-import java.util.regex.Pattern;
+import javax.management.Attribute;
+import javax.management.AttributeList;
 import javax.management.JMException;
 import javax.management.MBeanAttributeInfo;
 import javax.management.MBeanInfo;
@@ -30,27 +18,23 @@ import javax.management.remote.JMXServiceURL;
 import javax.management.remote.rmi.RMIConnectorServer;
 import javax.naming.Context;
 import javax.rmi.ssl.SslRMIClientSocketFactory;
+import java.io.IOException;
+import java.lang.management.ManagementFactory;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.logging.Level;
+import java.util.logging.Logger;
 
 
-public class JmxScraper {
-    private static final Logger logger = Logger.getLogger(JmxScraper.class.getName());;
-    private static final Pattern PROPERTY_PATTERN = Pattern.compile(
-            "([^,=:\\*\\?]+)" + // Name - non-empty, anything but comma, equals, colon, star, or question mark
-            "=" +  // Equals
-            "(" + // Either
-                "\"" + // Quoted
-                    "(?:" + // A possibly empty sequence of
-                    "[^\\\\\"]" + // Anything but backslash or quote
-                    "|\\\\\\\\" + // or an escaped backslash
-                    "|\\\\n" + // or an escaped newline
-                    "|\\\\\"" + // or an escaped quote
-                    "|\\\\\\?" + // or an escaped question mark
-                    "|\\\\\\*" + // or an escaped star
-                    ")*" +
-                "\"" +
-            "|" + // Or
-                "[^,=:\"]*" + // Unquoted - can be empty, anything but comma, equals, colon, or quote
-            ")");
+class JmxScraper {
+    private static final Logger logger = Logger.getLogger(JmxScraper.class.getName());
+
 
     public static interface MBeanReceiver {
         void recordBean(
@@ -63,14 +47,17 @@ public class JmxScraper {
             Object value);
     }
 
-    private MBeanReceiver receiver;
-    private String jmxUrl;
-    private String username;
-    private String password;
-    private boolean ssl;
-    private List<ObjectName> whitelistObjectNames, blacklistObjectNames;
+    private final MBeanReceiver receiver;
+    private final String jmxUrl;
+    private final String username;
+    private final String password;
+    private final boolean ssl;
+    private final List<ObjectName> whitelistObjectNames, blacklistObjectNames;
+    private final JmxMBeanPropertyCache jmxMBeanPropertyCache;
 
-    public JmxScraper(String jmxUrl, String username, String password, boolean ssl, List<ObjectName> whitelistObjectNames, List<ObjectName> blacklistObjectNames, MBeanReceiver receiver) {
+    public JmxScraper(String jmxUrl, String username, String password, boolean ssl,
+                      List<ObjectName> whitelistObjectNames, List<ObjectName> blacklistObjectNames,
+                      MBeanReceiver receiver, JmxMBeanPropertyCache jmxMBeanPropertyCache) {
         this.jmxUrl = jmxUrl;
         this.receiver = receiver;
         this.username = username;
@@ -78,6 +65,7 @@ public class JmxScraper {
         this.ssl = ssl;
         this.whitelistObjectNames = whitelistObjectNames;
         this.blacklistObjectNames = blacklistObjectNames;
+        this.jmxMBeanPropertyCache = jmxMBeanPropertyCache;
     }
 
     /**
@@ -108,17 +96,26 @@ public class JmxScraper {
         }
         try {
             // Query MBean names, see #89 for reasons queryMBeans() is used instead of queryNames()
-            Set<ObjectInstance> mBeanNames = new HashSet();
+            Set<ObjectName> mBeanNames = new HashSet<ObjectName>();
             for (ObjectName name : whitelistObjectNames) {
-                mBeanNames.addAll(beanConn.queryMBeans(name, null));
+                for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
+                    mBeanNames.add(instance.getObjectName());
+                }
             }
+
             for (ObjectName name : blacklistObjectNames) {
-                mBeanNames.removeAll(beanConn.queryMBeans(name, null));
+                for (ObjectInstance instance : beanConn.queryMBeans(name, null)) {
+                    mBeanNames.remove(instance.getObjectName());
+                }
             }
-            for (ObjectInstance name : mBeanNames) {
+
+            // Now that we have *only* the whitelisted mBeans, remove any old ones from the cache:
+            jmxMBeanPropertyCache.onlyKeepMBeans(mBeanNames);
+
+            for (ObjectName objectName : mBeanNames) {
                 long start = System.nanoTime();
-                scrapeBean(beanConn, name.getObjectName());
-                logger.fine("TIME: " + (System.nanoTime() - start) + " ns for " + name.getObjectName().toString());
+                scrapeBean(beanConn, objectName);
+                logger.fine("TIME: " + (System.nanoTime() - start) + " ns for " + objectName.toString());
             }
         } finally {
           if (jmxc != null) {
@@ -140,51 +137,38 @@ public class JmxScraper {
         }
         MBeanAttributeInfo[] attrInfos = info.getAttributes();
 
+        Map<String, MBeanAttributeInfo> name2AttrInfo = new LinkedHashMap<String, MBeanAttributeInfo>();
         for (int idx = 0; idx < attrInfos.length; ++idx) {
             MBeanAttributeInfo attr = attrInfos[idx];
             if (!attr.isReadable()) {
                 logScrape(mbeanName, attr, "not readable");
                 continue;
             }
-
-            Object value;
-            try {
-                value = beanConn.getAttribute(mbeanName, attr.getName());
-            } catch(Exception e) {
-                logScrape(mbeanName, attr, "Fail: " + e);
-                continue;
-            }
-
+            name2AttrInfo.put(attr.getName(), attr);
+        }
+        final AttributeList attributes;
+        try {
+            attributes = beanConn.getAttributes(mbeanName, name2AttrInfo.keySet().toArray(new String[0]));
+        } catch (Exception e) {
+            logScrape(mbeanName, name2AttrInfo.keySet(), "Fail: " + e);
+            return;
+        }
+        for (Attribute attribute : attributes.asList()) {
+            MBeanAttributeInfo attr = name2AttrInfo.get(attribute.getName());
             logScrape(mbeanName, attr, "process");
             processBeanValue(
                     mbeanName.getDomain(),
-                    getKeyPropertyList(mbeanName),
+                    jmxMBeanPropertyCache.getKeyPropertyList(mbeanName),
                     new LinkedList<String>(),
                     attr.getName(),
                     attr.getType(),
                     attr.getDescription(),
-                    value
-                    );
+                    attribute.getValue()
+            );
         }
     }
 
-    static LinkedHashMap<String, String> getKeyPropertyList(ObjectName mbeanName) {
-        // Implement a version of ObjectName.getKeyPropertyList that returns the
-        // properties in the ordered they were added (the ObjectName stores them
-        // in the order they were added).
-        LinkedHashMap<String, String> output = new LinkedHashMap<String, String>();
-        String properties = mbeanName.getKeyPropertyListString();
-        Matcher match = PROPERTY_PATTERN.matcher(properties);
-        while (match.lookingAt()) {
-            output.put(match.group(1), match.group(2));
-            properties = properties.substring(match.end());
-            if (properties.startsWith(",")) {
-                properties = properties.substring(1);
-            }
-            match.reset(properties);
-        }
-        return output;
-    }
+
 
     /**
      * Recursive function for exporting the values of an mBean.
@@ -253,7 +237,10 @@ public class JmxScraper {
                 if (valu instanceof CompositeData) {
                     CompositeData composite = (CompositeData) valu;
                     for (String idx : rowKeys) {
-                        l2s.put(idx, composite.get(idx).toString());
+                        Object obj = composite.get(idx);
+                        if (obj != null) {
+                            l2s.put(idx, obj.toString());
+                        }
                     }
                     for(String valueIdx : valueKeys) {
                         LinkedList<String> attrNames = extendedAttrKeys;
@@ -287,6 +274,9 @@ public class JmxScraper {
     /**
      * For debugging.
      */
+    private static void logScrape(ObjectName mbeanName, Set<String> names, String msg) {
+        logScrape(mbeanName + "_" + names, msg);
+    }
     private static void logScrape(ObjectName mbeanName, MBeanAttributeInfo attr, String msg) {
         logScrape(mbeanName + "'_'" + attr.getName(), msg);
     }
@@ -318,13 +308,16 @@ public class JmxScraper {
       List<ObjectName> objectNames = new LinkedList<ObjectName>();
       objectNames.add(null);
       if (args.length >= 3){
-            new JmxScraper(args[0], args[1], args[2], false, objectNames, new LinkedList<ObjectName>(), new StdoutWriter()).doScrape();
+            new JmxScraper(args[0], args[1], args[2], false, objectNames, new LinkedList<ObjectName>(),
+                    new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
         }
       else if (args.length > 0){
-          new JmxScraper(args[0], "", "", false, objectNames, new LinkedList<ObjectName>(), new StdoutWriter()).doScrape();
+          new JmxScraper(args[0], "", "", false, objectNames, new LinkedList<ObjectName>(),
+                  new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
       }
       else {
-          new JmxScraper("", "", "", false, objectNames, new LinkedList<ObjectName>(), new StdoutWriter()).doScrape();
+          new JmxScraper("", "", "", false, objectNames, new LinkedList<ObjectName>(),
+                  new StdoutWriter(), new JmxMBeanPropertyCache()).doScrape();
       }
     }
 }
