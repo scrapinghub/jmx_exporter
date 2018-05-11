@@ -13,7 +13,7 @@ ADD . /usr/src/jmx_exporter
 RUN mkdir -p /usr/share/jmx_exporter && \
     cd /usr/src/jmx_exporter && \
     mvn package && \
-    cp jmx_prometheus_httpserver/target/jmx_prometheus_httpserver-0.10-SNAPSHOT-jar-with-dependencies.jar /usr/share/jmx_exporter.jar && \
+    cp jmx_prometheus_httpserver/target/jmx_prometheus_httpserver-*-jar-with-dependencies.jar /usr/share/jmx_exporter.jar && \
     cd / && \
     rm -rf /root/.m2 && rm -rf /usr/src/jmx_exporter
 
