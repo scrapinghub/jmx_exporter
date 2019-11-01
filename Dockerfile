@@ -4,7 +4,7 @@ FROM maven:3 as build
 ADD . /usr/src/jmx_exporter
 WORKDIR /usr/src/jmx_exporter
 
-RUN mvn -pl jmx_prometheus_httpserver assembly:single
+RUN mvn -pl jmx_prometheus_httpserver compile assembly:single
 
 # Stage 2: Execute Prometheus HTTPServer
 FROM openjdk:8-jre
